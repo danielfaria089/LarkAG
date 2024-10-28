@@ -2,7 +2,7 @@
 
 #Read version from pyproject.toml
 from importlib.metadata import version
-__version__ = "0.2.3"
+__version__ = "1.0.0"
 
 from .generator_layer import GeneratorLayer
 from .processor_layer import ProcessorLayer
