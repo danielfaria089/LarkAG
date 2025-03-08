@@ -187,33 +187,44 @@ class InterpreterGenerator:
         return res
     
     def transformExpression(self, semanticDef, ruleName):
-        aux_string=semanticDef['code']
+        aux_string = semanticDef['code']
         
-        for attribute in semanticDef['attributes']:
-
-            # Ensure that it matches with the entire value, without trailing or leading characters
-            target = r'(?<!(@|\$|\w))'+ re.escape(attribute['value']) +r'\b'
-
-            if(attribute['symbol'] == ruleName and attribute['index'] == 0):
-                    if attribute['attribute'] == '':
-                        aux_string = re.sub(target, 'node', aux_string)
-                    else:
-                        aux_string = re.sub(target, f"node.{attribute['attribute']}", aux_string)
-
-            elif(attribute['index'] != -1):
-                if attribute['attribute'] == '':
-                    aux_string = re.sub(target, f"pointers['{attribute['symbol']}'][{attribute['index']}]", aux_string)
-                else:
-                    aux_string = re.sub(target, f"pointers['{attribute['symbol']}'][{attribute['index']}].{attribute['attribute']}", aux_string)
-
-            else:
-                aux_string = re.sub(target, f"pointers['{attribute['symbol']}']", aux_string)
-
-        # Replace all $symbol occurrences with len(pointers['symbol'])
+        # First, replace all $symbol occurrences with len(pointers['symbol'])
         dynamic = '|'.join(self.symbols[ruleName])
         regex = fr'(?<!\w)\$({dynamic})\b'
         pattern = re.compile(regex)
         aux_string = pattern.sub(lambda x: f"len(pointers['{x.group(1)}'])", aux_string)
+
+        # Sort attribute values by length (longest first) to handle overlapping patterns
+        attributes_sorted = sorted(semanticDef['attributes'], key=lambda x: len(x['value']), reverse=True)
+
+        # Track which attribute values have already been substituted
+        substituted_values = set()
+
+        # Then, replace attribute values
+        for attribute in attributes_sorted:
+            # Skip if this attribute value has already been substituted
+            if attribute['value'] in substituted_values:
+                continue
+
+            # Ensure that it matches with the entire value, without trailing or leading characters
+            target = r'(?<!(@|\$|\w))' + re.escape(attribute['value']) + r'\b'
+
+            if attribute['symbol'] == ruleName and attribute['index'] == 0:
+                if attribute['attribute'] == '':
+                    aux_string = re.sub(target, 'node', aux_string)
+                else:
+                    aux_string = re.sub(target, f"node.{attribute['attribute']}", aux_string)
+            elif attribute['index'] != -1:
+                if attribute['attribute'] == '':
+                    aux_string = re.sub(target, f"pointers['{attribute['symbol']}'][{attribute['index']}]", aux_string)
+                else:
+                    aux_string = re.sub(target, f"pointers['{attribute['symbol']}'][{attribute['index']}].{attribute['attribute']}", aux_string)
+            else:
+                aux_string = re.sub(target, f"pointers['{attribute['symbol']}']", aux_string)
+
+            # Mark this attribute value as substituted
+            substituted_values.add(attribute['value'])
 
         if semanticDef['type'] == 'cc':
             string = f"\t\tif(not({aux_string})):\n"
