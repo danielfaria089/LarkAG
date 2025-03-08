@@ -165,11 +165,6 @@ class InterpreterGenerator:
         res = []
 
         for match in attributes:
-            # Index out of range verification
-            if match[2]!= '':
-                if int(match[2]) > semantics['code'].count(match[1]):
-                    raise Exception("Index "+match[2]+" out of range for non-terminal "+match[1])            
-            
             if match[3]!='' and match[3] not in self.attributes[match[1]]:
                 raise Exception("Attribute "+match[3]+" not found in the attribute list of non-terminal "+match[1])
             
