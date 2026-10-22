@@ -3,6 +3,8 @@ import json
 from lark import Lark, Token
 from lark.visitors import Transformer
 
+from ..errors import AGDefinitionError
+
 
 class AGTransformer(Transformer):
     def __init__(self):
@@ -12,16 +14,19 @@ class AGTransformer(Transformer):
         self.semanticDict = {}
 
         self.symbolTable = {}
+        self.hasIgnore = False
 
     def start(self, tree):
-        return {'cfg': self.cfg+"\n%import common.WS\n%ignore WS\n", 'attributes': self.attributeDict, 'semantics': self.semanticDict, 'symbolTable': self.symbolTable}
+        # Whitespace is ignored by default, unless the grammar declares its own %ignore
+        cfg = self.cfg if self.hasIgnore else self.cfg + "\n%import common.WS\n%ignore WS\n"
+        return {'cfg': cfg, 'attributes': self.attributeDict, 'semantics': self.semanticDict, 'symbolTable': self.symbolTable}
     
 
     # SYNTAX
     def rule(self, tree):
         string=tree[0].value + tree[1]
         if len(tree) == 4:
-            string += tree[3]
+            string += tree[2]
         
         auxArray = []
         for idx, x in enumerate(tree[-1]['cfg']):
@@ -47,14 +52,48 @@ class AGTransformer(Transformer):
         string = tree[0].value + tree[1]
 
         if len(tree) == 4:
-            string += tree[3]
+            string += tree[2]
         
         string += ' : ' + " | ".join(tree[-1]['cfg'])
         self.cfg += string + '\n'
 
         return string
+
+    def ignore(self, tree):
+        self.hasIgnore = True
+        directive = '%ignore ' + ' | '.join(tree[0]['cfg'])
+        self.cfg += directive + '\n'
+        return directive
     
     
+    def import_path(self, tree):
+        return ''.join(x if isinstance(x, str) else x.value for x in tree)
+
+    def name_list(self, tree):
+        return '(' + ', '.join(tree) + ')'
+
+    def import_directive(self, tree):
+        directive = '%import ' + tree[0]
+        if tree[1] is not None:
+            directive += ' -> ' + tree[1]
+        self.cfg += directive + '\n'
+        return directive
+
+    def multi_import(self, tree):
+        directive = '%import ' + tree[0] + ' ' + tree[1]
+        self.cfg += directive + '\n'
+        return directive
+
+    def declare(self, tree):
+        directive = '%declare ' + ' '.join(tree)
+        self.cfg += directive + '\n'
+        return directive
+
+    def override_rule(self, tree):
+        # rule() already appended the definition as the last cfg line
+        self.cfg = self.cfg[:-len(tree[0]) - 1] + '%override ' + tree[0] + '\n'
+        return '%override ' + tree[0]
+
     def token_params(self, tree):
         if tree[0] == None:
             return ''
@@ -88,13 +127,20 @@ class AGTransformer(Transformer):
         return self.expansions(tree)
     
     def alias(self, tree):
-        if(len(tree)==2):
-            return {'cfg':tree[0]['cfg'], 'symbols': tree[0]['symbols'], 'semantics':tree[1]}
-        else:
-            return {'cfg':tree[0], 'symbols':None, 'semantics':None}
+        if len(tree) == 2:
+            return {
+                'cfg': tree[0]['cfg'],
+                'symbols': tree[0]['symbols'],
+                'semantics': tree[1],
+            }
+        return {
+            'cfg': tree[0]['cfg'],
+            'symbols': tree[0]['symbols'],
+            'semantics': None,
+        }
         
     def alias_token(self, tree):
-        return self.alias(tree)
+        return {'cfg': tree[0], 'symbols': None, 'semantics': None}
         
     def expansion(self, tree):
         symbols = []
@@ -102,29 +148,32 @@ class AGTransformer(Transformer):
         for x in tree:
             if type(x['tree'][0]) == Token:
                 symbols.append(x['tree'][0].value)
+            elif isinstance(x['tree'][0], dict):
+                symbols += x['tree'][0]['symbols']
         
         # Return the cfg of all the elements in the tree and the symbols list
         return {'cfg':' '.join([x['cfg'] for x in tree]), 'symbols':symbols}
     
     def expr(self, tree):
+        atom = tree[0]['cfg'] if isinstance(tree[0], dict) else tree[0]
         if tree[1] == None:
-            return {'cfg':tree[0], 'tree':tree}
-        elif len(tree) == 2:
-            return {'cfg':tree[0] + tree[1].value, 'tree':tree}
-        elif len(tree) == 3:
-            string = tree[0] + tree[1].value
-            if tree[2] != None:
-                string += tree[2].value
+            return {'cfg':atom, 'tree':tree}
+        elif tree[1].type == 'NUMBER':
+            string = atom + '~' + tree[1].value
+            if len(tree) == 3 and tree[2] != None:
+                string += '..' + tree[2].value
             return {'cfg':string, 'tree':tree}
+        elif len(tree) == 2:
+            return {'cfg':atom + tree[1].value, 'tree':tree}
         
     def atom(self, tree):
         return tree[0]
     
     def group(self, tree):
-        return '(' + tree[0] + ')'
+        return {'cfg': '(' + ' | '.join(tree[0]['cfg']) + ')', 'symbols': tree[0]['symbols']}
     
     def maybe(self, tree):
-        return '[' + tree[0] + ']'
+        return {'cfg': '[' + ' | '.join(tree[0]['cfg']) + ']', 'symbols': tree[0]['symbols']}
     
     def value(self, tree):
         return tree[0]
@@ -158,7 +207,7 @@ class AGTransformer(Transformer):
                 if(attribute['name'] not in self.attributeDict[tree[1]]):
                     self.attributeDict[tree[1]].update({attribute['name']: attribute})
                 else:
-                    raise Exception(f"Attribute '{attribute['name']}' is already defined for '{tree[1]}'")
+                    raise AGDefinitionError(f"Attribute '{attribute['name']}' is already defined for '{tree[1]}'")
             else:
                 self.attributeDict[tree[1]] = {attribute['name']: attribute}
         
@@ -174,7 +223,9 @@ class AGTransformer(Transformer):
         return tree[0].value
     
     def type(self, tree):
-        return tree[0].value + '[' + tree[1] + ']' if len(tree) == 2 else tree[0].value
+        if len(tree) == 1:
+            return tree[0].value
+        return tree[0].value + '[' + ', '.join(tree[1:]) + ']'
 
     def evaluations(self, tree):
         return tree

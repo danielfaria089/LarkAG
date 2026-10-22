@@ -1,11 +1,26 @@
-start: attributes+ _item+ //attributes -> attribute_block
+// Based on the grammar published at https://larkag.epl.di.uminho.pt/grammar.
+// Differences from the published version:
+//  - start: "attributes*" instead of "attributes+", so an AG may declare no attributes
+//    (e.g. one that only uses context conditions).
+//  - rule/token: RULE_DEF and TOKEN_DEF match a name only when followed by ":" (after an
+//    optional "{params}" and ".priority"), so that a rule without ER/CC/TR can be followed
+//    by another definition instead of the next name being read as part of its body.
+//  - statement: the alias for "%import" is "import_directive" ("import" is a Python keyword
+//    and cannot be a transformer method).
+//  - type: accepts several type parameters, e.g. dict[str, int].
+//  - semantics: ER, CC and TR blocks are optional and may appear in any order.
+//  - attribute_call: the occurrence index is INDEX (1 or more) instead of NUMBER, so that
+//    x[0] and x[-1] are rejected.
+//  - REGEXP: accepts escaped slashes and flags; CODE_EXPR: may span several lines.
+
+start: attributes* _item+ //attributes -> attribute_block
 
 _item: rule
      | token
      | statement
 
-rule: RULE rule_params priority? ":" expansions
-token: TOKEN token_params priority? ":" expansions_token
+rule: RULE_DEF rule_params priority? ":" expansions
+token: TOKEN_DEF token_params priority? ":" expansions_token
 
 rule_params: ["{" RULE ("," RULE)* "}"]
 token_params: ["{" TOKEN ("," TOKEN)* "}"]
@@ -13,7 +28,7 @@ token_params: ["{" TOKEN ("," TOKEN)* "}"]
 priority: "." NUMBER
 
 statement: "%ignore" expansions                    -> ignore
-         | "%import" import_path ["->" name]       -> import
+         | "%import" import_path ["->" name]       -> import_directive
          | "%import" import_path name_list         -> multi_import
          | "%override" rule                        -> override_rule
          | "%declare" name+                        -> declare
@@ -51,9 +66,9 @@ attribute: att_id ":" type
 
 nt_id: RULE
 att_id: RULE
-type: RULE ("[" type "]")?
+type: RULE ("[" type ("," type)* "]")?
 
-semantics: evaluations conditions? translations?
+semantics: (evaluations | conditions | translations)*
 
 evaluations: "ER" "{" (evaluation)* "}"
 evaluation: attribute_call "=" CODE_EXPR ";"
@@ -66,18 +81,21 @@ translation: fun_id "(" attribute_call ("," attribute_call)* ")" ";"
 
 fun_id: RULE
 
-attribute_call: nt_id ("[" NUMBER "]")? "." att_id
+attribute_call: nt_id ("[" INDEX "]")? "." att_id
 
 
 _VBAR: "|"
 OP: /[+*]|[?](?![a-z])/
 TOKEN: /[A-Z][_A-Z0-9]*/
 RULE: /[a-z][_a-z0-9]*/
+RULE_DEF: /[a-z][_a-z0-9]*(?=\s*(\{[^}]*\})?\s*(\.-?[0-9]+)?\s*:)/
+TOKEN_DEF: /[A-Z][_A-Z0-9]*(?=\s*(\{[^}]*\})?\s*(\.-?[0-9]+)?\s*:)/
 STRING: _STRING "i"?
-REGEXP: /\/.*?[^\\]\//
+REGEXP: /\/(?!\/)(\\\/|\\\\|[^\/])*?\/[imslux]*/
+INDEX: /[1-9][0-9]*/
 _NL: /(\r?\n)+\s*/
 
-CODE_EXPR.-1: /.+?(?=->|;)/
+CODE_EXPR.-1: /[\s\S]+?(?=->|;)/
 
 SA: "SA"
 IA: "IA"

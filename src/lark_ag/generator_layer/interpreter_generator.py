@@ -4,6 +4,8 @@ from lark.visitors import Interpreter
 import re
 import warnings
 
+from ..errors import AGDefinitionError, CircularDependencyError
+
 
 def __find_nth_occurrence__(lst, element, n):
     indices = [index for index, value in enumerate(lst) if value == element]
@@ -12,10 +14,13 @@ def __find_nth_occurrence__(lst, element, n):
     else:
         return -1  # Return -1 if nth occurrence doesn't exist
     
+
+
 def topological_sort(dependencies):
     # Initialize variables
     graph = {}
     visited = set()
+    on_stack = []
     order = []
 
     # Build graph
@@ -24,11 +29,15 @@ def topological_sort(dependencies):
 
     # Helper function for DFS
     def dfs(node):
+        if node in on_stack:
+            raise CircularDependencyError(on_stack[on_stack.index(node):] + [node])
         if node in visited:
             return
-        visited.add(node)
-        for neighbor in graph.get(node, []):
+        on_stack.append(node)
+        for neighbor in sorted(graph.get(node, [])):
             dfs(neighbor)
+        on_stack.pop()
+        visited.add(node)
         order.append(node)
 
     # Perform DFS for each node
@@ -57,7 +66,7 @@ class InterpreterGenerator:
 
     # Generates the file that will be used to calculate the attributes, allowing the user to see the generated code
     def generateFile(self, ident=4, name="MyInterpreter") -> str:
-        string = f"from lark import Lark, Token, Tree\nfrom lark.visitors import Interpreter\n\nclass {name}(Interpreter):"
+        string = f"from lark import Lark, Token, Tree\nfrom lark.visitors import Interpreter\nfrom lark_ag.errors import ContextConditionError\n\nclass {name}(Interpreter):"
         string += self.__helper_function_string__(ident)+'\n'
         string += '\n'.join([self.generateFunctionString(function, ident) for function in self.functions])
         return string
@@ -85,6 +94,21 @@ class InterpreterGenerator:
 \t\t\t\tpointers[name] = []
 \t\t\tpointers[name].append(child)
 \t\treturn pointers
+
+\tdef __at__(self, pointers, symbol, index):
+\t\tif index >= len(pointers.get(symbol, [])):
+\t\t\traise IndexError(f"'{symbol}' occurrence {index} is not available: this node has only {len(pointers.get(symbol, []))} (counting from 0)")
+\t\treturn pointers[symbol][index]
+
+\tdef visit(self, tree):
+\t\ttree._ag_visited = True
+\t\treturn super().visit(tree)
+
+\t# Children that no equation read are visited last, so that their CCs and TRs also run
+\tdef __visit_rest__(self, node):
+\t\tfor child in node.children:
+\t\t\tif isinstance(child, Tree) and not getattr(child, '_ag_visited', False):
+\t\t\t\tself.visit(child)
 '''.replace('\t', ' '*ident)
 
     def __orderSemantics__(self, semantics, ruleName):
@@ -92,7 +116,6 @@ class InterpreterGenerator:
         dependencies = {}
 
         #Auxiliary lists to help the ordering of the dependencies
-        visit_aux = []
         full_visit_aux = []
 
         #Auxiliary list to store the inherited attributes
@@ -104,13 +127,23 @@ class InterpreterGenerator:
                 key=attributes[0]['value']
                 start_idx=1
                 #If the LHS is not an attribute of the node, the attribute is inherited
-                if(attributes[0]['symbol'] != ruleName or attributes[0]['index'] > 0):
+                isChild = attributes[0]['symbol'] != ruleName or attributes[0]['index'] > 0
+                if(isChild):
                     inheritedAux.append(attributes[0]['value'])
+
+                #An equation defines a synthesized attribute of the node itself or an inherited attribute of a child
+                direction = self.attributes[attributes[0]['symbol']][attributes[0]['attribute']]['inheritance']
+                if direction != ('IA' if isChild else 'SA'):
+                    raise AGDefinitionError(f"Equation for '{key}' in rule '{ruleName}' must not define {'a synthesized attribute of a child' if isChild else 'an inherited attribute of the node itself'}")
             
-            #If the semantic is a TR or CC, the key is the whole line
+            #If the semantic is a TR or CC, the key is the whole line, prefixed so it never collides with an attribute name
             else:
-                key=semantic['code']
+                key=semantic['type']+': '+semantic['code']
                 start_idx=0
+
+            #An attribute occurrence can only be defined by one equation
+            if semantic['type'] == 'er' and key in dependencies and dependencies[key]['type'] == 'er':
+                raise AGDefinitionError(f"Attribute '{key}' is defined by more than one equation in rule '{ruleName}'")
 
             #If the key is not in the dependencies, add it
             if key not in dependencies:
@@ -119,23 +152,21 @@ class InterpreterGenerator:
                     dependencies[key]['message']=semantic['message']
 
             for idx in range(0, len(attributes)):
+                #Add all referred attributes as dependencies
                 if(idx>=start_idx and attributes[idx]['value'] not in dependencies[key]['attrDependencies']):
                     dependencies[key]['attrDependencies'].append(attributes[idx]['value'])
                 
                 #This is an access to the entire list of nodes with the same symbol ($<symbol>), so all children with this symbol need to be visited
                 if(attributes[idx]['index'] == -1 and (attributes[idx]['id'] not in full_visit_aux) and attributes[idx]['symbol'][0].islower()):
-                    dependencies[attributes[idx]['value']]={'expression':f"[self.visit(x) for x in pointers['{attributes[idx]['symbol']}']]", 'attrDependencies':[], 'type':'visit', 'attributes':[]}
+                    dependencies[attributes[idx]['value']]={'expression':f"[self.visit(x) for x in pointers.get('{attributes[idx]['symbol']}', [])]", 'attrDependencies':[], 'type':'visit', 'attributes':[]}
                     full_visit_aux.append(attributes[idx]['id'])
 
                 #Add the visit to the child that holds the attribute, as it depends on it
-                elif((attributes[idx]['symbol'] != ruleName or attributes[idx]['index'] > 0) and (attributes[idx]['id'] not in visit_aux and attributes[idx]['id'].split("[")[0] not in full_visit_aux) and attributes[idx]['symbol'][0].islower()):
-                    dependencies[attributes[idx]['value']]={'expression':f"self.visit(pointers['{attributes[idx]['symbol']}'][{attributes[idx]['index']}])", 'attrDependencies':[], 'type':'visit', 'attributes':[]}
-                    visit_aux.append(attributes[idx]['id'])
-
-
+                elif((attributes[idx]['symbol'] != ruleName or attributes[idx]['index'] > 0) and attributes[idx]['value'] not in dependencies and attributes[idx]['symbol'][0].islower()):
+                    dependencies[attributes[idx]['value']]={'expression':f"self.visit(self.__at__(pointers, '{attributes[idx]['symbol']}', {attributes[idx]['index']}))", 'attrDependencies':[], 'type':'visit', 'attributes':[]}
         
+        #Add all synthesized attributes as dependencies of inherited
         for key, value in dependencies.items():
-
             for inherited in inheritedAux:
                 if(value['type']=='visit' and key.split('.')[0]==inherited.split('.')[0] and not(inherited in value['attrDependencies'])):
                     value['attrDependencies'].append(inherited)
@@ -148,7 +179,9 @@ class InterpreterGenerator:
 
         for attribute in order:
             if(attribute in dependencies):
-                ordered_semantics.append({'code':dependencies[attribute]['expression'], 'type':dependencies[attribute]['type'], 'attributes':dependencies[attribute]['attributes']})
+                d = {'code':dependencies[attribute]['expression'], 'type':dependencies[attribute]['type'], 'attributes':dependencies[attribute]['attributes']}
+                if d not in ordered_semantics:
+                    ordered_semantics.append(d)
                 if(dependencies[attribute]['type']=='cc'):
                     ordered_semantics[-1]['message']=dependencies[attribute]['message']
                 
@@ -158,7 +191,7 @@ class InterpreterGenerator:
     def __extractAttributes__(self, semantics, ruleName):
         #Create a regex to find all the attributes in the code, using the symbol table
         dynamic = '|'.join(self.symbols[ruleName])
-        regex = fr'((?<!\w)({dynamic})(?!\w)(?:(?:\[(\d+)\])?\.([a-z][_a-zA-Z0-9]*))?)'
+        regex = fr'((?<![\w@$])({dynamic})(?!\w)(?:(?:\[(\d+)\])?\.([a-z][_a-zA-Z0-9]*))?)'
         pattern = re.compile(regex)
         attributes = pattern.findall(semantics['code'])
 
@@ -166,7 +199,7 @@ class InterpreterGenerator:
 
         for match in attributes:
             if match[3]!='' and match[3] not in self.attributes[match[1]]:
-                raise Exception("Attribute "+match[3]+" not found in the attribute list of non-terminal "+match[1])
+                raise AGDefinitionError("Attribute "+match[3]+" not found in the attribute list of non-terminal "+match[1])
             
             elem = {'value':match[0], 'symbol':match[1], 'index':int(match[2])-1 if match[2]!='' else 0, 'attribute':match[3]}
             elem['id'] = elem['symbol'] + '[' + str(elem['index']) + ']'
@@ -193,7 +226,7 @@ class InterpreterGenerator:
         dynamic = '|'.join(self.symbols[ruleName])
         regex = fr'(?<!\w)\$({dynamic})\b'
         pattern = re.compile(regex)
-        aux_string = pattern.sub(lambda x: f"len(pointers['{x.group(1)}'])", aux_string)
+        aux_string = pattern.sub(lambda x: f"len(pointers.get('{x.group(1)}', []))", aux_string)
 
         # Sort attribute values by length (longest first) to handle overlapping patterns
         attributes_sorted = sorted(semanticDef['attributes'], key=lambda x: len(x['value']), reverse=True)
@@ -208,7 +241,7 @@ class InterpreterGenerator:
                 continue
 
             # Ensure that it matches with the entire value, without trailing or leading characters
-            target = r'(?<!(@|\$|\w))' + re.escape(attribute['value']) + r'\b'
+            target = r'(?<!(@|\$|\w|\'))' + re.escape(attribute['value']) + r'\b'
 
             if attribute['symbol'] == ruleName and attribute['index'] == 0:
                 if attribute['attribute'] == '':
@@ -217,18 +250,18 @@ class InterpreterGenerator:
                     aux_string = re.sub(target, f"node.{attribute['attribute']}", aux_string)
             elif attribute['index'] != -1:
                 if attribute['attribute'] == '':
-                    aux_string = re.sub(target, f"pointers['{attribute['symbol']}'][{attribute['index']}]", aux_string)
+                    aux_string = re.sub(target, f"self.__at__(pointers, '{attribute['symbol']}', {attribute['index']})", aux_string)
                 else:
-                    aux_string = re.sub(target, f"pointers['{attribute['symbol']}'][{attribute['index']}].{attribute['attribute']}", aux_string)
+                    aux_string = re.sub(target, f"self.__at__(pointers, '{attribute['symbol']}', {attribute['index']}).{attribute['attribute']}", aux_string)
             else:
-                aux_string = re.sub(target, f"pointers['{attribute['symbol']}']", aux_string)
+                aux_string = re.sub(target, f"pointers.get('{attribute['symbol']}', [])", aux_string)
 
             # Mark this attribute value as substituted
             substituted_values.add(attribute['value'])
 
         if semanticDef['type'] == 'cc':
             string = f"\t\tif(not({aux_string})):\n"
-            string += f"\t\t\traise Exception(\"{semanticDef['message']}\")"
+            string += f"\t\t\traise ContextConditionError(\"{semanticDef['message']}\")"
         else:
             string = f"\t\t{aux_string}"
 
@@ -264,11 +297,18 @@ class InterpreterGenerator:
             aux.append((self.__extractAttributes__(semanticDef, ruleName), semanticDef))
 
         
-        ordered_semantics = self.__orderSemantics__(aux, ruleName)
+        try:
+            ordered_semantics = self.__orderSemantics__(aux, ruleName)
+        except CircularDependencyError as error:
+            raise CircularDependencyError(
+                f"Circular dependency in rule '{ruleName}', alternative {expansionIndex + 1}: {' -> '.join(error.args[0])} "
+                "(attributes needing a child to be visited more than once are not supported)") from None
 
         # Transform into code for ER, CC and TR
         for semanticDef in ordered_semantics:
             code.append(self.transformExpression(semanticDef, ruleName))
+
+        code.append("\t\tself.__visit_rest__(node)")
 
 
         return (funDef, code)
